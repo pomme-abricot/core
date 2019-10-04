@@ -27,6 +27,15 @@ from openalea.core import ScriptLibrary
 from openalea.core.dataflow import SubDataflow
 from openalea.core.interface import IFunction
 
+# test for distributed executions
+from openalea.core.metadata.provenance_data import Prov
+from openalea.core.metadata.cache_index import Cache_index
+from openalea.core.metadata.cloud_sites import Site, MultiSiteCloud, link_two_sites
+
+from openalea.core.metadata.costs import minimum_cost_site
+from openalea.core.metadata.scheduling_plan import SchedulingPlan
+from openalea.core.metadata.data_size import total_size
+
 
 PROVENANCE = False
 
@@ -144,6 +153,8 @@ def provenance(vid, node, start_time, end_time):
 # print the evaluation time
 # This variable has to be retrieve by the settings
 quantify = False
+# get the prov when evaluating
+provenance = False
 
 __evaluators__ = []
 
@@ -1193,3 +1204,130 @@ class SciFlowareEvaluation(AbstractEvaluation):
             print "Evaluation time: %s"%(t1-t0)
 
         return False
+
+
+class TestEval(AbstractEvaluation):
+    """ Basic evaluation algorithm """
+    __evaluators__.append("TestEval")
+
+    def __init__(self, dataflow):
+
+        AbstractEvaluation.__init__(self, dataflow)
+        # a property to specify if the node has already been evaluated
+        self._evaluated = set()
+
+        # GENERATE FAKE INFO
+        # provenance
+        p = Prov()
+        p.generate_fake()
+        self.p = p
+        # cache
+        c = Cache_index()
+        c.generate_fake()
+        self.c = c
+        # site cloud
+        m = MultiSiteCloud()
+        m.generate_fake()
+        self.m = m
+        # set input data on site s1:
+        m.list_sites["s1"].add_input_data("2")
+        # scheduling plan
+        self.SP = SchedulingPlan()
+
+
+    def is_stopped(self, vid, actor):
+        """ Return True if evaluation must be stop at this vertex """
+
+        if vid in self._evaluated:
+            return True
+
+        try:
+            if actor.block:
+                status = True
+                n = actor.get_nb_output()
+                outputs = [i for i in range(n) if actor.get_output(i) is not None ]
+                if not outputs:
+                    status = False
+                return status
+        except:
+            pass
+        return False
+
+    def eval_vertex(self, vid, *args):
+        """ Evaluate the vertex vid """
+        print "start the evaluation of node : " + str(vid)
+        df = self._dataflow
+        actor = df.actor(vid)
+
+        self._evaluated.add(vid)
+
+        # For each inputs
+        for pid in df.in_ports(vid):
+            inputs = []
+
+            cpt = 0
+            # For each connected node
+            for npid, nvid, nactor in self.get_parent_nodes(pid):
+                if not self.is_stopped(nvid, nactor):
+                    self.eval_vertex(nvid)
+
+                inputs.append(nactor.get_output(df.local_id(npid)))
+                cpt += 1
+
+            # set input as a list or a simple value
+            if (cpt == 1):
+                inputs = inputs[0]
+            if (cpt > 0):
+                actor.set_input(df.local_id(pid), inputs)
+
+        # Eval the node
+        print "start the execution of node : " + str(vid)
+        t0 = clock()
+
+        best_site, cost = minimum_cost_site(vid=vid, provenance=self.p, multisites=self.m)
+        self.SP.add_to_plan(vid, best_site)
+        self.SP.add_to_cost(cost)
+
+
+        self.eval_vertex_code(vid)
+
+        t1 = clock()
+        if provenance:
+            # print id task
+            print vid
+            # print actor.inputs
+
+            # data info
+            # if inputs:
+            #     for i in inputs:
+            print "size", total_size(actor.inputs)
+            # for o in range(actor.get_nb_output()):
+            #     print "out", actor.get_output(o)
+            print "size out", total_size(actor.outputs)
+
+            # execution info
+            print "Execution time: %s" % (t1 - t0)
+
+            # vm info
+
+
+
+
+    def eval(self, *args, **kwgs):
+        """ Evaluate the whole dataflow starting from leaves"""
+        t0 = clock()
+        df = self._dataflow
+
+        # Unvalidate all the nodes
+        self._evaluated.clear()
+
+        # Eval from the leaf
+        for vid in (vid for vid in df.vertices() if df.nb_out_edges(vid)==0):
+
+            self.eval_vertex(vid)
+
+        print "end evaluation - Scheduling plan : ", str(self.SP.plan)
+        print "total cost : ", str(self.SP.cost)
+        t1 = clock()
+        if quantify:
+            print "Evaluation time: %s"%(t1-t0)
