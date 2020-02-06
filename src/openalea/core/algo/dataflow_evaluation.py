@@ -31,16 +31,20 @@ from openalea.core.interface import IFunction
 
 from openalea.core.path import path
 from openalea.core import settings
+from os.path import expanduser
 
 import os
 import time
 import json
 
-from openalea.distributed.data.data_manager import load_data, check_data_to_load, write_data
+from openalea.distributed.data.data_manager import (load_data, check_data_to_load, write_data,
+                                                write_intermediate_data, load_intermediate_data)
+
 
 from openalea.distributed.provenance.provenanceDB import start_provdb
 from openalea.distributed.index.indexDB import start_index
 from openalea.distributed.index.graph_id import Task_UID_graph
+from openalea.distributed.cache.cache_selection import cache_add_selection, cache_reuse_selection
 # TODO: remove this id method - used in fragment evaluation - to get a general one
 from openalea.distributed.index.id import get_id
 
@@ -109,7 +113,21 @@ class AbstractEvaluation(object):
         """
         self._dataflow = dataflow
 
-        if kwargs.get("record_provenance"):
+        _start_index = False
+        _start_prov = False
+        if kwargs.get('use_cache'):
+            # The cache require the provenance and index databases
+            _start_index = True
+            _start_prov = True
+            self._use_cache=True
+            home = expanduser("~")
+            tpath = os.path.join(home, "data/mydatalocal")
+            self._cache_path=kwargs.get('cache_path', tpath)
+            self._cache_method=kwargs.get('cache_method', "adaptive")
+        else:
+            self._use_cache=False
+
+        if kwargs.get("record_provenance") or _start_prov:
             self._prov = RVProvenance()
             self._provdb = start_provdb(provenance_config=kwargs.get('provenance_config', None),
                                         provenance_type=kwargs.get('provenance_type', "Files"))
@@ -117,23 +135,21 @@ class AbstractEvaluation(object):
             self._prov = None
             self._provdb = None
 
-        if kwargs.get('use_index'):
+        if kwargs.get('use_index') or _start_index:
             #  Connect to the index db
-            # self._indexdb = start_index(index_config=kwargs.get('index_config', None),
-            #                             index_type=kwargs.get('index_type', "Cassandra"))
+            self._indexdb = start_index(index_config=kwargs.get('index_config', None),
+                                        index_type=kwargs.get('index_type', "Cassandra"))
             # Eval the workflow with a fake evaluation to get the tasks ids of each task
             real_eval_algo = dataflow.eval_algo
             dataflow.eval_algo= "FakeEvaluation"
             dataflow.eval()
             tid = dataflow.node(1).get_output("task_ids")
-            print tid
             dataflow.eval_algo= real_eval_algo
-            # self._index = 
-            # self._index 
+            self._index = tid
         else:
             self._index = None
             self._indexdb = None
-
+        
 
     def eval(self, *args, **kwargs):
         """todo"""
@@ -158,14 +174,26 @@ class AbstractEvaluation(object):
 
             t0 = clock()
             ret = node.eval()
-
             dt = clock() - t0
+
             if self._prov is not None:
                 taskitem = self._prov.after_eval(self._dataflow, vid, dt)
                 if self._provdb and taskitem:
                     self._provdb.add_task_item(taskitem)
-            # if self._index is not None:
-            #     self._index.add
+
+            if self._use_cache:
+                # Caching use provenance informations - If provdb is not set, it will fail
+                if taskitem:
+                    # check if the data is to be stored - depends on the cache_method
+                    indicator=cache_add_selection(node_metadata=taskitem, cache_method=self._cache_method)
+                    if indicator:
+                        cpath = os.path.join(self._cache_path, taskitem['task_id'])
+                        write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
+                        # update cache index:
+                        self._indexdb.add_data(data_id=taskitem['task_id'], path=cpath, exec_data=False, cache_data=True)
+                else:
+                    print("No provenance for this task: ", vid)
+                    print("unable to cache the intermediate data")
 
             # When an exception is raised, a flag is set.
             # So we remove it when evaluation is ok.
@@ -246,6 +274,24 @@ class BrutEvaluation(AbstractEvaluation):
         actor = df.actor(vid)
 
         self._evaluated.add(vid)
+
+        # check if the output data exist in cache
+        if self._use_cache:
+            # check if the data is to be reuse - For now it is always
+            indicator=cache_reuse_selection(node_metadata="", cache_method="")
+            if indicator:
+                try:
+                    path = self._indexdb.is_in(data_id=self._index[vid])
+                    out_data = load_intermediate_data(dname="", data_path=path)
+                    print("load cache at : ", path)
+                    print('data loaded = ', out_data)
+                    for port, value in enumerate(out_data):
+                        actor.set_output(port, value)
+                    return
+                except:
+                    # the data couldnt be loaded - execute the node
+                    print("fail to load from cache for node : ", vid)
+        
 
         # For each inputs
         for pid in df.in_ports(vid):
@@ -1444,7 +1490,9 @@ class FragmentEvaluation(AbstractEvaluation):
         self._fragment_infos = kwargs.get("fragment_infos", None)
 
         # Define the path where execution data is store during execution - delete after
-        tpath = path(settings.get_openalea_home_dir()) / "execution_data"
+        # tpath = path(settings.get_openalea_home_dir()) / "execution_data"
+        home = expanduser("~")
+        tpath = os.path.join(home, "execution_data")
         print("use ", kwargs.get("tmp_path", tpath), " as temporary file path")
         self._tmp_path = kwargs.get("tmp_path", tpath)
 
