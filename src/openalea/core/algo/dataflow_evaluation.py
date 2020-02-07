@@ -36,6 +36,7 @@ from os.path import expanduser
 import os
 import time
 import json
+from uuid import uuid1
 
 from openalea.distributed.data.data_manager import (load_data, check_data_to_load, write_data,
                                                 write_intermediate_data, load_intermediate_data)
@@ -127,14 +128,6 @@ class AbstractEvaluation(object):
         else:
             self._use_cache=False
 
-        if kwargs.get("record_provenance") or _start_prov:
-            self._prov = RVProvenance()
-            self._provdb = start_provdb(provenance_config=kwargs.get('provenance_config', None),
-                                        provenance_type=kwargs.get('provenance_type', "Files"))
-        else:
-            self._prov = None
-            self._provdb = None
-
         if kwargs.get('use_index') or _start_index:
             #  Connect to the index db
             self._indexdb = start_index(index_config=kwargs.get('index_config', None),
@@ -150,6 +143,16 @@ class AbstractEvaluation(object):
             self._index = None
             self._indexdb = None
         
+        self._reuse_method = kwargs.get('reuse_method', "None")
+
+        if kwargs.get("record_provenance") or _start_prov:
+            self._prov = RVProvenance(index=self._index, execution_id=uuid1().hex)
+            self._provdb = start_provdb(provenance_config=kwargs.get('provenance_config', None),
+                                        provenance_type=kwargs.get('provenance_type', "Files"))
+        else:
+            self._prov = None
+            self._provdb = None
+        
 
     def eval(self, *args, **kwargs):
         """todo"""
@@ -164,7 +167,6 @@ class AbstractEvaluation(object):
         Evaluate the vertex vid.
         Can raise an exception if evaluation failed.
         """
-
         node = self._dataflow.actor(vid)
 
         try:
@@ -184,13 +186,13 @@ class AbstractEvaluation(object):
             if self._use_cache:
                 # Caching use provenance informations - If provdb is not set, it will fail
                 if taskitem:
-                    # check if the data is to be stored - depends on the cache_method
+                    # check if the data is to be stored - depends on the cache_method                    
                     indicator=cache_add_selection(node_metadata=taskitem, cache_method=self._cache_method)
                     if indicator:
-                        cpath = os.path.join(self._cache_path, taskitem['task_id'])
+                        cpath = os.path.join(self._cache_path, self._index[vid])
                         write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
                         # update cache index:
-                        self._indexdb.add_data(data_id=taskitem['task_id'], path=cpath, exec_data=False, cache_data=True)
+                        self._indexdb.add_data(data_id=self._index[vid], path=cpath, exec_data=False, cache_data=True)
                 else:
                     print("No provenance for this task: ", vid)
                     print("unable to cache the intermediate data")
@@ -275,18 +277,20 @@ class BrutEvaluation(AbstractEvaluation):
 
         self._evaluated.add(vid)
 
-        # check if the output data exist in cache
-        if self._use_cache:
+        # check if the output data exist in cache - AND remove node _in and _out
+        if self._use_cache and (vid!=1 and vid!=0):
             # check if the data is to be reuse - For now it is always
-            indicator=cache_reuse_selection(node_metadata="", cache_method="")
-            if indicator:
+            indicator=cache_reuse_selection(node_metadata="", reuse_method=self._reuse_method)
+            path = self._indexdb.is_in(data_id=self._index[vid])
+            if indicator and path:
                 try:
-                    path = self._indexdb.is_in(data_id=self._index[vid])
                     out_data = load_intermediate_data(dname="", data_path=path)
                     print("load cache at : ", path)
                     print('data loaded = ', out_data)
                     for port, value in enumerate(out_data):
                         actor.set_output(port, value)
+                    actor.raise_exception = False
+                    actor.notify_listeners(('data_modified', None, None))
                     return
                 except:
                     # the data couldnt be loaded - execute the node
@@ -1653,7 +1657,6 @@ class FakeEvaluation(AbstractEvaluation):
         Evaluate the vertex vid.
         Can raise an exception if evaluation failed.
         """
-
         node = self._dataflow.actor(vid)
 
         try:
@@ -1694,7 +1697,6 @@ class FakeEvaluation(AbstractEvaluation):
 
     def eval_vertex(self, vid, *args, **kwargs):
         """ Evaluate the vertex vid """
-        
         df = self._dataflow
         actor = df.actor(vid)
         self._evaluated.add(vid)
@@ -1722,7 +1724,6 @@ class FakeEvaluation(AbstractEvaluation):
 
     def eval(self, *args, **kwargs):
         """ Evaluate the whole dataflow starting from leaves"""
-
         t0 = time.time()
         df = self._dataflow
 
@@ -1744,3 +1745,178 @@ class FakeEvaluation(AbstractEvaluation):
         self._dataflow.node(1).set_output("task_ids", tid)
         return 
         
+
+class EmptyEvaluation(AbstractEvaluation):
+    """ Evaluation to get id of egdes """
+    __evaluators__.append("EmptyEvaluation")
+
+    def __init__(self, dataflow, *args, **kwargs):
+
+        AbstractEvaluation.__init__(self, dataflow, *args, **kwargs)
+        # a property to specify if the node has already been evaluated
+        self._evaluated = set()
+
+    def is_stopped(self, vid, actor):
+        """ Return True if evaluation must be stop at this vertex """
+
+        if vid in self._evaluated:
+            return True
+
+        try:
+            if actor.block:
+                status = True
+                n = actor.get_nb_output()
+                outputs = [i for i in range(n) if
+                           actor.get_output(i) is not None]
+                if not outputs:
+                    status = False
+                return status
+        except:
+            pass
+        return False
+
+
+    def eval_vertex_code(self, vid, *args, **kwargs):
+        """
+        Evaluate the vertex vid.
+        Can raise an exception if evaluation failed.
+        """
+
+        node = self._dataflow.actor(vid)
+
+        try:
+
+            if self._prov is not None:
+                self._prov.before_eval(self._dataflow, vid)
+
+            t0 = clock()
+            # ret = node.eval()
+            ret = 0
+            dt = clock() - t0
+
+            if self._prov is not None:
+                taskitem = self._prov.after_eval(self._dataflow, vid, dt)
+                if self._provdb and taskitem:
+                    # TODO: some data id is wrongly set
+                    taskitem['task_id'] = self._index[vid]
+                    self._provdb.add_task_item(taskitem)
+                if taskitem:
+                    print taskitem['task_id']
+                    print self._index[vid]
+            if self._use_cache:
+                # Caching use provenance informations - If provdb is not set, it will fail
+                if taskitem:
+                    # check if the data is to be stored - depends on the cache_method                    
+                    indicator=cache_add_selection(node_metadata=taskitem, cache_method=self._cache_method)
+                    if indicator:
+                        cpath = os.path.join(self._cache_path, taskitem['task_id'])
+                        write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
+                        # update cache index:
+                        self._indexdb.add_data(data_id=taskitem['task_id'], path=cpath, exec_data=False, cache_data=True)
+                else:
+                    print("No provenance for this task: ", vid)
+                    print("unable to cache the intermediate data")
+
+            # When an exception is raised, a flag is set.
+            # So we remove it when evaluation is ok.
+            node.raise_exception = False
+            # if hasattr(node, 'raise_exception'):
+            #     del node.raise_exception
+            node.notify_listeners(('data_modified', None, None))
+            return ret
+
+        except EvaluationException, e:
+            e.vid = vid
+            e.node = node
+            # When an exception is raised, a flag is set.
+            node.raise_exception = True
+            node.notify_listeners(('data_modified', None, None))
+            raise e
+
+        except Exception, e:
+            # When an exception is raised, a flag is set.
+            node.raise_exception = True
+            node.notify_listeners(('data_modified', None, None))
+            raise EvaluationException(vid, node, e, \
+                                      tb.format_tb(sys.exc_info()[2]))
+
+
+    def eval_vertex(self, vid, *args, **kwargs):
+        """ Evaluate the vertex vid """
+
+        df = self._dataflow
+        actor = df.actor(vid)
+
+        self._evaluated.add(vid)
+
+        # check if the output data exist in cache
+        if self._use_cache:
+            # check if the data is to be reuse - For now it is always
+            indicator=cache_reuse_selection(node_metadata="", reuse_method=self._reuse_method)
+            if indicator:
+                try:
+                    path = self._indexdb.is_in(data_id=self._index[vid])
+                    out_data = load_intermediate_data(dname="", data_path=path)
+                    print("load cache at : ", path)
+                    print('data loaded = ', out_data)
+                    for port, value in enumerate(out_data):
+                        actor.set_output(port, value)
+                    return
+                except:
+                    # the data couldnt be loaded - execute the node
+                    print("fail to load from cache for node : ", vid)
+        
+
+        # For each inputs
+        for pid in df.in_ports(vid):
+            inputs = []
+
+            cpt = 0
+            # For each connected node
+            for npid, nvid, nactor in self.get_parent_nodes(pid):
+                if not self.is_stopped(nvid, nactor):
+                    self.eval_vertex(nvid)
+
+                inputs.append(nactor.get_output(df.local_id(npid)))
+                cpt += 1
+
+            # set input as a list or a simple value
+            if (cpt == 1):
+                inputs = inputs[0]
+            if (cpt > 0):
+                actor.set_input(df.local_id(pid), inputs)
+
+        # Eval the node
+        self.eval_vertex_code(vid)
+
+    def eval(self, *args, **kwargs):
+        """ Evaluate the whole dataflow starting from leaves"""
+
+        t0 = time.time()
+        df = self._dataflow
+
+        if self._prov is not None:
+            self._prov.init(df)
+            self._prov.time_init = t0
+        # Unvalidate all the nodes
+        self._evaluated.clear()
+
+        # Eval from the leaf
+        for vid in (vid for vid in df.vertices() if df.nb_out_edges(vid) == 0):
+            self.eval_vertex(vid)
+
+        t1 = time.time()
+
+        if self._prov is not None:
+            self._prov.time_end = t1
+            wfitem = self._prov.as_wlformat()
+        if self._provdb is not None:
+            self._provdb.add_wf_item(wfitem)
+
+            # close remote connections
+            self._provdb.close()
+
+        print self._index
+
+        if quantify:
+            print "Evaluation time: %s" % (t1 - t0)
