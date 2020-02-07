@@ -43,7 +43,7 @@ from openalea.distributed.data.data_manager import (load_data, check_data_to_loa
 
 
 from openalea.distributed.provenance.provenanceDB import start_provdb
-from openalea.distributed.index.indexDB import start_index
+from openalea.distributed.index.indexDB import start_index, get_vm
 from openalea.distributed.index.graph_id import Task_UID_graph
 from openalea.distributed.cache.cache_selection import cache_add_selection, cache_reuse_selection
 # TODO: remove this id method - used in fragment evaluation - to get a general one
@@ -1745,6 +1745,143 @@ class FakeEvaluation(AbstractEvaluation):
         self._dataflow.node(1).set_output("task_ids", tid)
         return 
         
+
+class SimplifyEvaluation(AbstractEvaluation):
+    """ Evaluation to get id of egdes """
+    __evaluators__.append("SimplifyEvaluation")
+
+    def __init__(self, dataflow, *args, **kwargs):
+
+        AbstractEvaluation.__init__(self, dataflow, *args, **kwargs)
+        # a property to specify if the node has already been evaluated
+        self._evaluated = set()
+
+        self._cached_data = {}
+        self._to_exec = []
+
+    def is_stopped(self, vid, actor):
+        """ Return True if evaluation must be stop at this vertex """
+
+        if vid in self._evaluated:
+            return True
+
+        try:
+            if actor.block:
+                status = True
+                n = actor.get_nb_output()
+                outputs = [i for i in range(n) if
+                           actor.get_output(i) is not None]
+                if not outputs:
+                    status = False
+                return status
+        except:
+            pass
+        return False
+
+
+    def eval_vertex_code(self, vid, *args, **kwargs):
+        """
+        Evaluate the vertex vid.
+        Can raise an exception if evaluation failed.
+        """
+
+        node = self._dataflow.actor(vid)
+
+        try:
+            t0 = clock()
+            # ret = node.eval()
+            self._to_exec.append(vid)
+            ret = 0
+            dt = clock() - t0
+
+            # When an exception is raised, a flag is set.
+            # So we remove it when evaluation is ok.
+            node.raise_exception = False
+            # if hasattr(node, 'raise_exception'):
+            #     del node.raise_exception
+            node.notify_listeners(('data_modified', None, None))
+            return ret
+
+        except EvaluationException, e:
+            e.vid = vid
+            e.node = node
+            # When an exception is raised, a flag is set.
+            node.raise_exception = True
+            node.notify_listeners(('data_modified', None, None))
+            raise e
+
+        except Exception, e:
+            # When an exception is raised, a flag is set.
+            node.raise_exception = True
+            node.notify_listeners(('data_modified', None, None))
+            raise EvaluationException(vid, node, e, \
+                                      tb.format_tb(sys.exc_info()[2]))
+
+
+    def eval_vertex(self, vid, *args, **kwargs):
+        """ Evaluate the vertex vid """
+
+        df = self._dataflow
+        actor = df.actor(vid)
+
+        self._evaluated.add(vid)
+
+        # check if the output data exist in cache
+        try:
+            path = self._indexdb.is_in(data_id=self._index[vid])
+            # get site and size of data
+            site = get_vm(path)
+            size = os.path.getsize(path)
+            previous_s = self._cached_data.get(site,0.)
+            self._cached_data[site] = previous_s + size
+            return
+        except:
+            pass
+        
+
+        # For each inputs
+        for pid in df.in_ports(vid):
+            inputs = []
+
+            cpt = 0
+            # For each connected node
+            for npid, nvid, nactor in self.get_parent_nodes(pid):
+                if not self.is_stopped(nvid, nactor):
+                    self.eval_vertex(nvid)
+
+                inputs.append(nactor.get_output(df.local_id(npid)))
+                cpt += 1
+
+            # set input as a list or a simple value
+            if (cpt == 1):
+                inputs = inputs[0]
+            if (cpt > 0):
+                actor.set_input(df.local_id(pid), inputs)
+
+        # Eval the node
+        self.eval_vertex_code(vid)
+
+    def eval(self, *args, **kwargs):
+        """ Evaluate the whole dataflow starting from leaves"""
+
+        t0 = time.time()
+        df = self._dataflow
+
+        # Unvalidate all the nodes
+        self._evaluated.clear()
+
+        # Eval from the leaf
+        for vid in (vid for vid in df.vertices() if df.nb_out_edges(vid) == 0):
+            self.eval_vertex(vid)
+
+        t1 = time.time()
+
+        print self._cached_data
+        print self._to_exec
+
+        if quantify:
+            print "Evaluation time: %s" % (t1 - t0)
+
 
 class EmptyEvaluation(AbstractEvaluation):
     """ Evaluation to get id of egdes """
