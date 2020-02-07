@@ -37,6 +37,7 @@ import os
 import time
 import json
 from uuid import uuid1
+import socket
 
 from openalea.distributed.data.data_manager import (load_data, check_data_to_load, write_data,
                                                 write_intermediate_data, load_intermediate_data)
@@ -44,6 +45,7 @@ from openalea.distributed.data.data_manager import (load_data, check_data_to_loa
 
 from openalea.distributed.provenance.provenanceDB import start_provdb
 from openalea.distributed.index.indexDB import start_index, get_vm
+from openalea.distributed.index.cloudsitedb import start_cloudsite
 from openalea.distributed.index.graph_id import Task_UID_graph
 from openalea.distributed.cache.cache_selection import cache_add_selection, cache_reuse_selection
 # TODO: remove this id method - used in fragment evaluation - to get a general one
@@ -127,6 +129,12 @@ class AbstractEvaluation(object):
             self._cache_method=kwargs.get('cache_method', "adaptive")
         else:
             self._use_cache=False
+
+        if kwargs.get('multisite'):
+            self._cloudsitedb = start_cloudsite(cloudsite_config=kwargs.get('cloudsite_config', None),
+                                                cloudsite_type=kwargs.get('cloudsite_type', "Cassandra"))
+        else:
+            self._cloudsitedb = None
 
         if kwargs.get('use_index') or _start_index:
             #  Connect to the index db
@@ -340,6 +348,8 @@ class BrutEvaluation(AbstractEvaluation):
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
+            # ADD THE site of computation - 
+            wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
 
@@ -622,6 +632,8 @@ class LambdaEvaluation(PriorityEvaluation):
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
+            # ADD THE site of computation - 
+            wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
 
@@ -1291,6 +1303,8 @@ class TestEvaluation(AbstractEvaluation):
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
+            # ADD THE site of computation - 
+            wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
 
@@ -1403,6 +1417,8 @@ class ZMQEvaluation(AbstractEvaluation):
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
+            # ADD THE site of computation - 
+            wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
 
@@ -1610,6 +1626,8 @@ class FragmentEvaluation(AbstractEvaluation):
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
+            # ADD THE site of computation - 
+            wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
 
@@ -1830,7 +1848,7 @@ class SimplifyEvaluation(AbstractEvaluation):
         try:
             path = self._indexdb.is_in(data_id=self._index[vid])
             # get site and size of data
-            site = get_vm(path)
+            site = self._indexdb.get_site(data_id=self._index[vid])
             size = os.path.getsize(path)
             previous_s = self._cached_data.get(site,0.)
             self._cached_data[site] = previous_s + size
@@ -1949,7 +1967,9 @@ class EmptyEvaluation(AbstractEvaluation):
                         cpath = os.path.join(self._cache_path, taskitem['task_id'])
                         write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
                         # update cache index:
-                        self._indexdb.add_data(data_id=taskitem['task_id'], path=cpath, exec_data=False, cache_data=True)
+                        self._indexdb.add_data(data_id=taskitem['task_id'], path=cpath, 
+                                                site=self._cloudsitedb.get_site(device_name=socket.gethostname()), 
+                                                exec_data=False, cache_data=True)
                 else:
                     print("No provenance for this task: ", vid)
                     print("unable to cache the intermediate data")
@@ -2047,6 +2067,8 @@ class EmptyEvaluation(AbstractEvaluation):
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
+            # ADD THE site of computation - 
+            wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
 
