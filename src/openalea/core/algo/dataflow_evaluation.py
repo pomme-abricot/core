@@ -47,7 +47,7 @@ from openalea.distributed.provenance.provenanceDB import start_provdb
 from openalea.distributed.index.indexDB import start_index, get_vm
 from openalea.distributed.index.cloudsitedb import start_cloudsite
 from openalea.distributed.index.graph_id import Task_UID_graph
-from openalea.distributed.cache.cache_selection import cache_add_selection, cache_reuse_selection
+from openalea.distributed.cache.cache_selection import cache_add_selection, cache_reuse_selection, get_cache_site
 # TODO: remove this id method - used in fragment evaluation - to get a general one
 from openalea.distributed.index.id import get_id
 
@@ -115,6 +115,8 @@ class AbstractEvaluation(object):
         :param dataflow: to be done
         """
         self._dataflow = dataflow
+        self._metadata = {}
+        t0 = time.time()
 
         _start_index = False
         _start_prov = False
@@ -127,8 +129,10 @@ class AbstractEvaluation(object):
             tpath = os.path.join(home, "data/mydatalocal")
             self._cache_path=kwargs.get('cache_path', tpath)
             self._cache_method=kwargs.get('cache_method', "adaptive")
+            self._cache_site_method=kwargs.get('cache_site_method', "transfer")
         else:
             self._use_cache=False
+        self._reuse_method = kwargs.get('reuse_method', "None")
 
         if kwargs.get('multisite'):
             self._cloudsitedb = start_cloudsite(cloudsite_config=kwargs.get('cloudsite_config', None),
@@ -151,12 +155,24 @@ class AbstractEvaluation(object):
             self._index = None
             self._indexdb = None
         
-        self._reuse_method = kwargs.get('reuse_method', "None")
-
         if kwargs.get("record_provenance") or _start_prov:
-            self._prov = RVProvenance(index=self._index, execution_id=uuid1().hex)
+            execution_id = uuid1().hex
+            self._prov = RVProvenance(index=self._index, execution_id=execution_id)
             self._provdb = start_provdb(provenance_config=kwargs.get('provenance_config', None),
                                         provenance_type=kwargs.get('provenance_type', "Files"))
+
+            self._metadata["execution_id"]=execution_id
+            self._metadata["workflow_id"]=kwargs.get("workflow_id", execution_id)
+            self._metadata["makespan"]=0.
+            self._metadata["input_size"]=0.
+            self._metadata["data_tranfered"]=0.
+            self._metadata["time_transfer"]=0.
+            self._metadata["time_communication"]=0.
+            self._metadata["site"]=""
+            self._metadata["time_initialization"]=kwargs.get('time_initialization', 0.)
+            self._metadata["time_connectdb"]=time.time() - t0
+            self._metadata["task_exec"]=[]
+            self._metadata["task_reuse"]=[]
         else:
             self._prov = None
             self._provdb = None
@@ -185,6 +201,10 @@ class AbstractEvaluation(object):
             t0 = clock()
             ret = node.eval()
             dt = clock() - t0
+            try:
+                self._metadata["task_exec"].append(self._index[vid]) 
+            except:
+                pass
 
             if self._prov is not None:
                 taskitem = self._prov.after_eval(self._dataflow, vid, dt)
@@ -197,10 +217,24 @@ class AbstractEvaluation(object):
                     # check if the data is to be stored - depends on the cache_method                    
                     indicator=cache_add_selection(node_metadata=taskitem, cache_method=self._cache_method)
                     if indicator:
-                        cpath = os.path.join(self._cache_path, self._index[vid])
-                        write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
-                        # update cache index:
-                        self._indexdb.add_data(data_id=self._index[vid], path=cpath, exec_data=False, cache_data=True)
+                        # Get the site where the cache will be stored
+                        if self._cloudsitedb:
+                            current_site = self._cloudsitedb.get_site(device_name=socket.gethostname())
+                            cache_site = get_cache_site(cache_site_method=self._cache_site_method, current_site=current_site, data_metadata=taskitem, cloudsite=self._cloudsitedb)
+                        else:
+                            cache_site = ""
+                        # if no site have storage - cahce_site is False
+                        if cache_site:
+                            cpath = os.path.join(self._cache_path, cache_site, self._index[vid])
+                            write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
+                            # update cloud site infos
+                            self._cloudsitedb.update_storage_availability(site=cache_site, storage_use=os.path.getsize(cpath))
+                            # update cache index:
+                            # find site name: 
+                            self._indexdb.add_data(data_id=self._index[vid], 
+                                                    path=cpath, 
+                                                    site=cache_site,
+                                                    exec_data=False, cache_data=True)
                 else:
                     print("No provenance for this task: ", vid)
                     print("unable to cache the intermediate data")
@@ -288,6 +322,7 @@ class BrutEvaluation(AbstractEvaluation):
         # check if the output data exist in cache - AND remove node _in and _out
         if self._use_cache and (vid!=1 and vid!=0):
             # check if the data is to be reuse - For now it is always
+            t0=time.time()
             indicator=cache_reuse_selection(node_metadata="", reuse_method=self._reuse_method)
             path = self._indexdb.is_in(data_id=self._index[vid])
             if indicator and path:
@@ -297,6 +332,9 @@ class BrutEvaluation(AbstractEvaluation):
                     print('data loaded = ', out_data)
                     for port, value in enumerate(out_data):
                         actor.set_output(port, value)
+                    self._metadata["task_reuse"].append(self._index[vid])
+                    self._metadata["data_tranfered"]+= os.path.getsize(path)
+                    self._metadata["time_transfer"]+= time.time()-t0
                     actor.raise_exception = False
                     actor.notify_listeners(('data_modified', None, None))
                     return
@@ -345,6 +383,12 @@ class BrutEvaluation(AbstractEvaluation):
 
         t1 = time.time()
 
+        self._metadata["makespan"]= t1-t0 
+        if self._cloudsitedb:
+            self._metadata["site"]=self._cloudsitedb.get_site(device_name=socket.gethostname())
+        else:
+            self._metadata["site"]="local"
+
         if self._prov is not None:
             self._prov.time_end = t1
             wfitem = self._prov.as_wlformat()
@@ -352,6 +396,7 @@ class BrutEvaluation(AbstractEvaluation):
             wfitem["site"] = socket.gethostname()
         if self._provdb is not None:
             self._provdb.add_wf_item(wfitem)
+            self._provdb.add_execution_item(self._metadata)
 
             # close remote connections
             self._provdb.close()
@@ -1964,11 +2009,22 @@ class EmptyEvaluation(AbstractEvaluation):
                     # check if the data is to be stored - depends on the cache_method                    
                     indicator=cache_add_selection(node_metadata=taskitem, cache_method=self._cache_method)
                     if indicator:
-                        cpath = os.path.join(self._cache_path, taskitem['task_id'])
+                        # GET THE SITE WHERE THE CACHE WILL BE STORED
+                        if self._cloudsitedb:
+                            current_site = self._cloudsitedb.get_site(device_name=socket.gethostname())
+                            cache_site = get_cache_site(cache_site_method=self._cache_site_method, current_site=current_site, data_metadata="")
+                        else:
+                            cache_site = ""
+                        cpath = os.path.join(self._cache_path, cache_site, taskitem['task_id'])
                         write_intermediate_data(data=node.outputs, dname="", data_path=cpath)
+                        # update cloud site infos
+                        try:
+                            self._cloudsitedb.update_storage_availability(site=cache_site, storage_use=os.path.getsize(cpath))
+                        except:
+                            self._cloudsitedb.update_storage_availability(site=cache_site, storage_use=os.path.getsize(cpath))
                         # update cache index:
                         self._indexdb.add_data(data_id=taskitem['task_id'], path=cpath, 
-                                                site=self._cloudsitedb.get_site(device_name=socket.gethostname()), 
+                                                site=cache_site, 
                                                 exec_data=False, cache_data=True)
                 else:
                     print("No provenance for this task: ", vid)
